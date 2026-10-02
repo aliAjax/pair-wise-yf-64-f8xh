@@ -159,7 +159,8 @@ export default component$(() => {
     <main class={`conference-shell ${state.lowLatency ? 'low-latency' : ''}`}>
       <header class="hero">
         <div><span class="pill">{locale.lang}</span><h1>同声传译与发言队列</h1><p>{activeRoom().name} · {activeRoom().topic}</p></div>
-        <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <a href="/screens" style="display:inline-flex;align-items:center;border-radius:9px;padding:8px 12px;background:#e1eeee;color:#18565a;text-decoration:none;font-size:14px">主备大屏跟播</a>
           <select value={state.activeRoomId} onChange$={(event) => selectRoom$((event.target as HTMLSelectElement).value)}>{state.rooms.map((room) => <option value={room.id}>{room.name}</option>)}</select>
           <button class="secondary" onClick$={() => state.lowLatency = !state.lowLatency}>{state.lowLatency ? '退出低延迟' : '低延迟模式'}</button>
         </div>

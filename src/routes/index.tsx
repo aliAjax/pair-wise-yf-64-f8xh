@@ -5,6 +5,20 @@ import { useForm, zodForm$ } from '@modular-forms/qwik';
 import { useSpeakLocale } from 'qwik-speak';
 import { z } from 'zod';
 import type { DocumentHead } from '@builder.io/qwik-city';
+import type { FeedEvent, ScreenState } from '~/screens/engine';
+import {
+  appendFeedEvent,
+  createScreens,
+  ensureScreenRooms,
+  livePush,
+  migrateScreens,
+  publishRevision,
+  reconcileBoth,
+  screenOffline,
+  screenPause,
+  screenReconnect,
+  tickScreen
+} from '~/screens/simulation';
 
 type SpeechStatus = 'queued' | 'speaking' | 'done' | 'skipped';
 type InterpreterStatus = 'active' | 'handoff' | 'standby';
@@ -24,6 +38,13 @@ interface ConferenceState {
   captions: Caption[];
   audits: Audit[];
   lowLatency: boolean;
+  /** 每个厅一条 append-only 权威修订流（厅内 seq 单调递增） */
+  captionFeed: Record<string, FeedEvent[]>;
+  feedSeq: Record<string, number>;
+  /** 主、备两块大屏各自的跟播/对账状态（按厅隔离） */
+  screens: { primary: ScreenState; backup: ScreenState };
+  /** 模拟会场网络：同一条修订连推两遍 */
+  dupPush: Record<string, boolean>;
 }
 
 const now = new Date().toISOString();
@@ -52,6 +73,17 @@ const seed: ConferenceState = {
   captions: [
     { id: 'caption-1', speechId: 'speech-1', roomId: 'hall-a', language: '中文', interpreter: '周雨', text: '我们需要把适应资金与可衡量的社区韧性目标绑定。', revision: 2, at: now }
   ],
+  captionFeed: {
+    // 历史已保存的修订流；大屏状态升级时按最新版 v2 起步，不重播历史
+    'hall-a': [
+      { seq: 1, captionId: 'caption-1', speechId: 'speech-1', language: '中文', interpreter: '周雨', text: '我们需要把适应资金与可衡量的目标绑定。', revision: 1, at: new Date(Date.now() - 300000).toISOString() },
+      { seq: 2, captionId: 'caption-1', speechId: 'speech-1', language: '中文', interpreter: '周雨', text: '我们需要把适应资金与可衡量的社区韧性目标绑定。', revision: 2, at: now }
+    ],
+    'hall-b': []
+  },
+  feedSeq: { 'hall-a': 2, 'hall-b': 0 },
+  screens: createScreens(),
+  dupPush: { 'hall-a': false, 'hall-b': false },
   audits: [
     { id: 'audit-1', at: now, roomId: 'hall-a', message: 'Amina Diallo 开始发言，中文频道由周雨接续' },
     { id: 'audit-2', at: new Date(Date.now() - 90000).toISOString(), roomId: 'hall-a', message: '临时插话申请已插入队列第2位' }
@@ -70,8 +102,49 @@ const queueSchema = z.object({
 type QueueForm = z.infer<typeof queueSchema>;
 
 function readState(): ConferenceState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('conference-interpretation-v1') ?? 'null') as ConferenceState ?? seed; } catch { return seed; }
+  const fallback = structuredClone(seed);
+  fallback.screens = createScreens();
+  ensureScreenRooms(fallback.screens, fallback.rooms.map((room) => room.id));
+  // 全新进入（含旧数据升级）：大屏没有游标，按已保存的最新版本起步，不重播历史
+  migrateScreens(fallback.screens, fallback.captionFeed);
+  if (typeof localStorage === 'undefined') return fallback;
+  try {
+    const saved = JSON.parse(localStorage.getItem('conference-interpretation-v2') ?? 'null') as ConferenceState | null;
+    if (!saved) return fallback;
+    // 补齐新版本字段（旧存档升级）
+    if (!saved.captionFeed) {
+      saved.captionFeed = {};
+      saved.feedSeq = {};
+      for (const caption of saved.captions ?? []) {
+        if (!saved.captionFeed[caption.roomId]) saved.captionFeed[caption.roomId] = [];
+        const seq = saved.captionFeed[caption.roomId].length + 1;
+        saved.captionFeed[caption.roomId].push({
+          seq,
+          captionId: caption.id,
+          speechId: caption.speechId,
+          language: caption.language,
+          interpreter: caption.interpreter,
+          text: caption.text,
+          revision: caption.revision,
+          at: caption.at
+        });
+        saved.feedSeq[caption.roomId] = seq;
+      }
+    }
+    if (!saved.screens) {
+      saved.screens = createScreens();
+      ensureScreenRooms(saved.screens, saved.rooms.map((room) => room.id));
+      migrateScreens(saved.screens, saved.captionFeed);
+      saved.audits?.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: saved.activeRoomId, message: '旧数据升级：大屏无游标，按已保存的最新字幕版本起步' });
+    }
+    for (const room of saved.rooms) {
+      if (!saved.screens.primary.rooms[room.id]) ensureScreenRooms(saved.screens, [room.id]);
+    }
+    saved.dupPush ??= {};
+    return saved;
+  } catch {
+    return fallback;
+  }
 }
 
 const advanceSpeech$ = $((state: ConferenceState, id: string, status: SpeechStatus) => {
@@ -86,12 +159,38 @@ const addCaption$ = $((state: ConferenceState, speechId: string, text: string) =
   const speech = state.speechQueue.find((item) => item.id === speechId);
   const channel = state.channels.find((item) => item.roomId === speech?.roomId && item.language === '中文');
   if (!speech || !channel || !text.trim()) return;
+  const roomId = speech.roomId;
   const existing = state.captions.find((item) => item.speechId === speechId && item.language === channel.language);
+  const revision = (existing?.revision ?? 0) + 1;
+  const captionId = existing?.id ?? crypto.randomUUID();
+  const at = new Date().toISOString();
+
   if (existing) {
-    state.captions = state.captions.map((item) => item.id === existing.id ? { ...item, text, revision: item.revision + 1, interpreter: channel.interpreter, at: new Date().toISOString() } : item);
+    state.captions = state.captions.map((item) => item.id === existing.id ? { ...item, text, revision, interpreter: channel.interpreter, at } : item);
   } else {
-    state.captions.unshift({ id: crypto.randomUUID(), speechId, roomId: speech.roomId, language: channel.language, interpreter: channel.interpreter, text, revision: 1, at: new Date().toISOString() });
+    state.captions.unshift({ id: captionId, speechId, roomId, language: channel.language, interpreter: channel.interpreter, text, revision: 1, at });
   }
+
+  // 权威修订流追加一版；译员改稿后对已播过旧版的屏令其已播游标失效
+  const event = appendFeedEvent(state.captionFeed, state.feedSeq, roomId, {
+    captionId,
+    speechId,
+    language: channel.language,
+    interpreter: channel.interpreter,
+    text,
+    revision
+  });
+  publishRevision(state.screens, roomId, captionId, revision);
+  livePush(state.screens, roomId, event, { duplicate: state.dupPush[roomId] });
+
+  state.audits.unshift({
+    id: crypto.randomUUID(),
+    at,
+    roomId,
+    message: existing
+      ? `译员修订 ${captionId} 至 v${revision}：已播过旧版的屏游标失效，待重新对账/补播新版`
+      : `新字幕 ${captionId} v1 已向主备屏直播推送`
+  });
 });
 
 export default component$(() => {
@@ -110,7 +209,30 @@ export default component$(() => {
 
   useVisibleTask$(({ track }) => {
     track(() => state);
-    localStorage.setItem('conference-interpretation-v1', JSON.stringify(state));
+    localStorage.setItem('conference-interpretation-v2', JSON.stringify(state));
+  });
+
+  // 大屏跟播时钟：每 1.2 秒各屏按 seq 播一条；暂停的屏自然不动。
+  useVisibleTask$(() => {
+    const timer = setInterval(() => {
+      const roomId = state.activeRoomId;
+      tickScreen(state.screens.primary, roomId);
+      tickScreen(state.screens.backup, roomId);
+      const feedMaxSeq = state.feedSeq[roomId] ?? 0;
+      // 两块屏跟同一厅都播完后自动比对差异，把漏播的补进各自待播队列
+      const a = state.screens.primary.rooms[roomId];
+      const b = state.screens.backup.rooms[roomId];
+      if (a && b && a.pending.length === 0 && b.pending.length === 0 && !a.paused && !b.paused && a.online && b.online) {
+        const needCheck = a.reconciledThrough < feedMaxSeq || b.reconciledThrough < feedMaxSeq;
+        if (needCheck) {
+          const touched = reconcileBoth(state.screens, roomId, state.captionFeed[roomId] ?? []);
+          if (touched) {
+            state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: '两块屏播完自动对账：发现漏播/作废差异，已补入待播' });
+          }
+        }
+      }
+    }, 1200);
+    return () => clearInterval(timer);
   });
 
   const activeRoom = () => state.rooms.find((room) => room.id === state.activeRoomId) ?? state.rooms[0];
@@ -153,6 +275,54 @@ export default component$(() => {
   const approveTerm$ = $((id: string) => {
     state.terms = state.terms.map((term) => term.id === id ? { ...term, approved: true } : term);
     state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `术语已批准：${state.terms.find((term) => term.id === id)?.phrase}` });
+  });
+
+  // —— 主备大屏跟播控制 ——
+  const toggleScreenNetwork$ = $((id: 'primary' | 'backup') => {
+    const roomId = state.activeRoomId;
+    const room = state.screens[id].rooms[roomId];
+    if (!room) return;
+    const label = id === 'primary' ? '主屏' : '备屏';
+    if (room.online) {
+      screenOffline(state.screens[id], roomId);
+      state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: `${label}断网：直播修订暂存厅内，本屏待播队列与游标保留` });
+    } else {
+      const filled = screenReconnect(state.screens[id], roomId, state.captionFeed[roomId] ?? []);
+      state.audits.unshift({
+        id: crypto.randomUUID(),
+        at: new Date().toISOString(),
+        roomId,
+        message: filled.length > 0
+          ? `${label}网络恢复：按序号补齐 ${filled.length} 条攒下修订，补播走完前直播新修订排在后面`
+          : `${label}网络恢复：无缺失修订`
+      });
+    }
+  });
+
+  const toggleScreenPause$ = $((id: 'primary' | 'backup') => {
+    const room = state.screens[id].rooms[state.activeRoomId];
+    if (!room) return;
+    screenPause(state.screens[id], state.activeRoomId, !room.paused);
+    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${id === 'primary' ? '主屏' : '备屏'}主持人${room.paused ? '恢复' : '暂停'}（只管本屏），待播从暂停点继续` });
+  });
+
+  const reconcileNow$ = $(() => {
+    const roomId = state.activeRoomId;
+    const touched = reconcileBoth(state.screens, roomId, state.captionFeed[roomId] ?? []);
+    state.audits.unshift({
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      roomId,
+      message: touched ? '手动对账完成：漏播已补入待播，旧修订差异已记录' : '手动对账完成：两块屏内容一致，无差异'
+    });
+  });
+
+  const resetScreensToLatest$ = $(() => {
+    // 演示“旧数据升级”：清掉屏状态，按当前最新保存版本重新起步
+    state.screens = createScreens();
+    ensureScreenRooms(state.screens, state.rooms.map((room) => room.id));
+    migrateScreens(state.screens, state.captionFeed);
+    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: '大屏状态重置为升级场景：无历史游标，按各厅最新版本起步' });
   });
 
   return (
@@ -214,6 +384,81 @@ export default component$(() => {
         <article class="panel">
           <h2>操作与交接时间线</h2>
           {state.audits.filter((audit) => audit.roomId === state.activeRoomId).slice(0, 10).map((audit) => <div style="padding:10px 0;border-bottom:1px solid #e6efee" key={audit.id}><small>{new Date(audit.at).toLocaleTimeString()}</small><div>{audit.message}</div></div>)}
+        </article>
+      </section>
+
+      <section style="margin-top:18px">
+        <article class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+            <h2 style="margin:0">主备大屏 · 修订序号跟播与对账</h2>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <label class="pill" style="gap:6px;cursor:pointer">
+                <input type="checkbox" style="width:auto" checked={!!state.dupPush[state.activeRoomId]} onChange$={() => (state.dupPush[state.activeRoomId] = !state.dupPush[state.activeRoomId])} />
+                模拟同条重复推送（播两遍→只播一次）
+              </label>
+              <button class="secondary" onClick$={reconcileNow$}>立即两块屏对账</button>
+              <button class="secondary" onClick$={resetScreensToLatest$}>模拟旧数据升级（无游标）</button>
+            </div>
+          </div>
+          <p style="color:#59747b;font-size:13px;margin:8px 0 14px">
+            修订按厅内序号 #seq 投递，游标按每条字幕的 v 版本推进；重连补齐走 catch-up，主持人暂停只管本屏，两屏播完自动比对漏播。
+          </p>
+          <div class="screen-grid">
+            {(['primary', 'backup'] as const).map((id) => {
+              const room = state.screens[id].rooms[state.activeRoomId];
+              if (!room) return <div />;
+              const lastPlayed = room.played[0];
+              const feedEvent = lastPlayed ? (state.captionFeed[state.activeRoomId] ?? []).find((event) => event.seq === lastPlayed.seq) : undefined;
+              const cursorEntries = Object.entries(room.cursors)
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(([captionId, rev]) => {
+                  const short = captionId.split('-').slice(-1)[0].slice(0, 4);
+                  return room.cursorsValid[captionId] === false ? `…${short}⚠v${rev}` : `…${short}:v${rev}`;
+                });
+              return (
+                <div class={`screen-card ${room.online ? '' : 'offline'} ${room.paused ? 'paused' : ''}`} key={id}>
+                  <div class="screen-head">
+                    <b>{id === 'primary' ? '主屏' : '备屏'}</b>
+                    <span class="pill">{room.online ? '在线' : '断网'}</span>
+                    {room.paused && <span class="pill" style="background:#fde9d3;color:#9a5b13">本屏暂停</span>}
+                    {room.catchingUp && <span class="pill" style="background:#e6ecfd;color:#34489a">补播中</span>}
+                  </div>
+                  <div class="screen-stage">
+                    {feedEvent ? (
+                      <>
+                        <div class="screen-now">#{feedEvent.seq} · {feedEvent.interpreter} · v{feedEvent.revision}</div>
+                        <div class="screen-text">{feedEvent.text}</div>
+                      </>
+                    ) : <div class="screen-text" style="color:#8aa3a7">（等待本厅修订…旧数据升级时从最新版起步，不重播历史）</div>}
+                  </div>
+                  <div style="display:flex;gap:8px;margin:10px 0">
+                    <button onClick$={() => toggleScreenNetwork$(id)}>{room.online ? '模拟断网' : '网络恢复·补齐'}</button>
+                    <button class="secondary" onClick$={() => toggleScreenPause$(id)}>{room.paused ? '恢复本屏' : '暂停本屏'}</button>
+                  </div>
+                  <div style="font-size:12px;color:#59747b;margin-bottom:6px">游标：{cursorEntries.length > 0 ? cursorEntries.join('  ') : '无（按最新保存版本起步）'}</div>
+                  <div class="screen-sub"><b>待播队列（{room.pending.length}）</b>
+                    {room.pending.length === 0 ? <small>空</small> : room.pending.slice(0, 5).map((event, idx) => (
+                      <span class="queue-chip" key={`${event.seq}-${idx}`}>#{event.seq} v{event.revision}</span>
+                    ))}
+                  </div>
+                  <div class="screen-sub"><b>对账差异（{room.diffs.length}）</b>
+                    {room.diffs.length === 0 ? <small>无</small> : room.diffs.slice(0, 4).map((diff) => (
+                      <div class={`diff-line diff-${diff.kind}`} key={diff.id}>
+                        <span class="diff-tag">{diff.kind === 'stale' ? '作废' : diff.kind === 'dup' ? '重复' : diff.kind === 'gap-filled' ? '补齐' : diff.kind === 'peer-filled' ? '对端补缺' : '游标失效'}</span>
+                        {diff.detail}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <h3 style="margin:16px 0 8px">本厅权威修订流（共 {state.feedSeq[state.activeRoomId] ?? 0} 个序号）</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            {(state.captionFeed[state.activeRoomId] ?? []).slice(-14).map((event) => (
+              <span class="feed-chip" key={event.seq}>#{event.seq} v{event.revision} · {event.text.slice(0, 10)}…</span>
+            ))}
+          </div>
         </article>
       </section>
     </main>

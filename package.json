@@ -3,13 +3,17 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": "^18.17.0 || ^20.3.0 || >=21.0.0" },
+  "engines": {
+    "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
+  },
   "scripts": {
     "dev": "vite --mode ssr --host 0.0.0.0 --port 62029",
     "build": "qwik build",
     "build.client": "vite build",
     "build.preview": "vite build --ssr src/entry.preview.tsx",
     "build.types": "tsc --incremental --noEmit",
+    "test": "tsx --test src/screens/engine.test.ts",
+    "test:e2e": "tsx src/screens/scenario.e2e.ts",
     "preview": "qwik build preview && vite preview --host 0.0.0.0 --port 62029",
     "start": "vite --mode ssr --host 0.0.0.0 --port 62029"
   },
@@ -22,6 +26,7 @@
     "@types/node": "^22.18.1",
     "ignore": "^7.0.5",
     "qwik-speak": "^0.24.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
     "vite-tsconfig-paths": "^4.3.2",

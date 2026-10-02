@@ -16,4 +16,22 @@ button.secondary { background:#e1eeee; color:#18565a; }
 button.danger { background:#c2413b; }
 input, select, textarea { width:100%; border:1px solid #bdd3d2; border-radius:9px; padding:8px 10px; background:white; }
 .low-latency .decorative { display:none; }
-@media(max-width:900px){ .grid{grid-template-columns:1fr}.queue-row{grid-template-columns:36px 1fr}.queue-row>*:nth-child(n+3){display:none}.hero{align-items:flex-start;flex-direction:column} }
+.screen-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.screen-card { border:1px solid #cfdfdd; border-radius:14px; padding:14px; background:linear-gradient(180deg,#f7fcfa,#eef7f5); }
+.screen-card.offline { border-color:#e0b4b0; background:linear-gradient(180deg,#fdf3f2,#f9eceb); }
+.screen-card.paused { border-style:dashed; }
+.screen-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+.screen-stage { min-height:96px; border-radius:12px; background:#10303a; color:#eafaf7; padding:14px; display:flex; flex-direction:column; justify-content:center; gap:6px; }
+.offline .screen-stage { background:#3d3332; }
+.screen-now { font-size:12px; color:#9fd8d1; letter-spacing:.04em; }
+.screen-text { font-size:18px; line-height:1.45; font-weight:600; }
+.screen-sub { margin-top:10px; font-size:13px; display:flex; flex-direction:column; gap:4px; }
+.screen-sub small { color:#8aa3a7; }
+.queue-chip { display:inline-block; background:#e2f3f1; color:#086764; border-radius:999px; padding:2px 10px; font-size:12px; margin-right:6px; margin-bottom:4px; }
+.feed-chip { display:inline-block; background:#f1f6f5; border:1px solid #d3e2e0; border-radius:999px; padding:3px 11px; font-size:12px; color:#41616a; }
+.diff-line { font-size:12px; color:#59747b; line-height:1.4; }
+.diff-tag { display:inline-block; border-radius:6px; padding:0 6px; margin-right:6px; font-size:11px; }
+.diff-stale .diff-tag, .diff-dup .diff-tag { background:#f6ddd0; color:#9a4a1f; }
+.diff-gap-filled .diff-tag, .diff-peer-filled .diff-tag { background:#d9eadb; color:#2c6e3a; }
+.diff-cursor-reset .diff-tag { background:#e2e6f8; color:#34489a; }
+@media(max-width:900px){ .grid{grid-template-columns:1fr}.screen-grid{grid-template-columns:1fr}.queue-row{grid-template-columns:36px 1fr}.queue-row>*:nth-child(n+3){display:none}.hero{align-items:flex-start;flex-direction:column} }
